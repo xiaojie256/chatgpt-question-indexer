@@ -3,8 +3,10 @@ from types import SimpleNamespace
 from chatgpt_question_indexer.models import Question
 from chatgpt_question_indexer.windows_uia import (
     WindowsUIA,
+    _accumulate_questions,
     _intersects,
     _nearby_indexes,
+    _pair_signature,
     _scan_step,
     _transient_end_jump,
 )
@@ -64,7 +66,37 @@ def test_rectangle_intersection_excludes_offscreen_messages():
 def test_scan_step_keeps_overlap_for_small_viewports():
     assert _scan_step(8.3) < 8.3
     assert _scan_step(8.3) == 8.3 * 0.65
+    assert _scan_step(0.1) == 0.5
     assert _scan_step(100) == 25
+
+
+def test_pair_signature_changes_with_virtualized_position():
+    first = FakeElement(rectangle=(10, 10, 20, 20))
+    second = FakeElement(rectangle=(10, 30, 20, 40))
+
+    before = _pair_signature([(FakeElement(), first)])
+    after = _pair_signature([(FakeElement(), second)])
+
+    assert before != after
+
+
+def test_scan_accumulator_updates_overlap_without_rebuilding_order():
+    existing = [question(1)]
+    existing[0].text_hash = "first"
+    positions = {"first": 0}
+    updated = question(1)
+    updated.text_hash = "first"
+    updated.scroll_percent = 25
+    new_question = question(2)
+    new_question.text_hash = "second"
+
+    added = _accumulate_questions(
+        existing, positions, [updated, new_question]
+    )
+
+    assert added == 1
+    assert [item.text_hash for item in existing] == ["first", "second"]
+    assert existing[0].scroll_percent == 25
 
 
 def test_mid_scan_bottom_report_is_treated_as_transient():

@@ -31,6 +31,10 @@ LOGGER = logging.getLogger(__name__)
 NO_SCROLL = -1.0
 
 
+class ScanCancelled(RuntimeError):
+    pass
+
+
 @dataclass(slots=True)
 class WindowDetails:
     handle: int
@@ -102,7 +106,7 @@ def _intersects(
 
 def _scan_step(view_size: float) -> float:
     """Advance with enough overlap to catch short bubbles between long answers."""
-    return max(3.0, min(25.0, view_size * 0.65))
+    return max(0.5, min(25.0, view_size * 0.65))
 
 
 def _transient_end_jump(requested: float, current: float) -> bool:
@@ -110,8 +114,35 @@ def _transient_end_jump(requested: float, current: float) -> bool:
     return requested < 95.0 and current >= 99.0
 
 
+def _pair_signature(pairs: list[tuple[object, object]]) -> tuple:
+    return tuple(
+        (_runtime_id(bubble), _rectangle(bubble))
+        for _marker, bubble in pairs
+    )
+
+
+def _accumulate_questions(
+    questions: list[Question],
+    positions: dict[str, int],
+    page: list[Question],
+) -> int:
+    """Merge one scan page in O(page size), preserving conversation order."""
+    added = 0
+    for question in page:
+        position = positions.get(question.text_hash)
+        if position is None:
+            positions[question.text_hash] = len(questions)
+            questions.append(question)
+            added += 1
+        else:
+            questions[position] = question
+    return added
+
+
 class WindowsUIA:
     _cached_window_handle = 0
+    _cached_container_class = ""
+    _cached_selected_title_class = ""
 
     def find_window(self):
         from pywinauto import Desktop
@@ -124,7 +155,7 @@ class WindowsUIA:
                     handle=self._cached_window_handle
                 ).wrapper_object()
             except Exception:
-                self._cached_window_handle = 0
+                type(self)._cached_window_handle = 0
 
         handles = []
 
@@ -140,7 +171,7 @@ class WindowsUIA:
         win32gui.EnumWindows(collect, None)
         if handles:
             handle = max(handles, key=lambda item: item[0])[1]
-            self._cached_window_handle = handle
+            type(self)._cached_window_handle = handle
             return Desktop(backend="uia").window(handle=handle).wrapper_object()
 
         candidates = []
@@ -152,7 +183,7 @@ class WindowsUIA:
         if not candidates:
             raise RuntimeError("未找到 ChatGPT 桌面应用主窗口")
         wrapper = max(candidates, key=lambda item: item[0])[1]
-        self._cached_window_handle = wrapper.handle
+        type(self)._cached_window_handle = wrapper.handle
         return wrapper
 
     def details(self) -> WindowDetails:
@@ -170,7 +201,25 @@ class WindowsUIA:
     def find_thread_container(self, window=None):
         window = window or self.find_window()
         candidates = []
-        for element in window.descendants(control_type="Group"):
+        if self._cached_container_class:
+            try:
+                candidates = [
+                    element
+                    for element in window.descendants(
+                        control_type="Group",
+                        class_name=self._cached_container_class,
+                    )
+                    if element.iface_scroll.CurrentVerticallyScrollable
+                ]
+            except Exception:
+                candidates = []
+
+        elements = (
+            []
+            if candidates
+            else window.descendants(control_type="Group")
+        )
+        for element in elements:
             try:
                 class_name = element.element_info.class_name or ""
                 if "thread-scroll-container" not in class_name:
@@ -178,6 +227,7 @@ class WindowsUIA:
                 scroll = element.iface_scroll
                 if scroll.CurrentVerticallyScrollable:
                     candidates.append(element)
+                    type(self)._cached_container_class = class_name
             except Exception:
                 continue
         if not candidates:
@@ -206,7 +256,27 @@ class WindowsUIA:
         last_error = None
         for attempt in range(3):
             try:
-                children = container.children()
+                if hasattr(container, "backend") and hasattr(
+                    container, "element_info"
+                ):
+                    children = container.element_info.children()
+                    wrapper_class = container.backend.generic_wrapper_class
+
+                    def element_info(item):
+                        return item
+
+                    def wrapper(item):
+                        return wrapper_class(item)
+
+                else:
+                    children = container.children()
+
+                    def element_info(item):
+                        return item.element_info
+
+                    def wrapper(item):
+                        return item
+
                 break
             except Exception as exc:
                 last_error = exc
@@ -217,51 +287,126 @@ class WindowsUIA:
         pairs = []
         for index, marker in enumerate(children):
             try:
+                marker_info = element_info(marker)
                 if (
-                    (marker.element_info.name or "").strip() not in USER_MARKERS
-                    or "sr-only" not in (marker.element_info.class_name or "")
+                    (marker_info.name or "").strip() not in USER_MARKERS
+                    or "sr-only" not in (marker_info.class_name or "")
                 ):
                     continue
             except Exception:
                 continue
             for candidate in children[index + 1 : index + 5]:
                 try:
-                    name = (candidate.element_info.name or "").strip()
+                    candidate_info = element_info(candidate)
+                    name = (candidate_info.name or "").strip()
                     if name in USER_MARKERS + ASSISTANT_MARKERS:
                         break
-                    if candidate.element_info.control_type == "Group":
-                        pairs.append((marker, candidate))
+                    if candidate_info.control_type == "Group":
+                        pairs.append(
+                            (wrapper(marker), wrapper(candidate))
+                        )
                         break
                 except Exception:
                     continue
         return pairs
 
     @classmethod
-    def _snapshot(cls, container) -> list[AccessibleNode]:
-        """Build only user marker/bubble nodes, not the entire conversation tree."""
-        nodes = []
+    def _visible_pairs(cls, container) -> list[tuple[object, object]]:
         container_rect = _rectangle(container)
-        for marker, bubble in cls._message_pairs(container):
-            # Chromium keeps some virtualized/off-screen messages in the UIA
-            # tree. Recording them on every scan page collapses all saved
-            # percentages toward the final page and ruins fallback accuracy.
-            if not _intersects(_rectangle(bubble), container_rect):
-                continue
+        return [
+            (marker, bubble)
+            for marker, bubble in cls._message_pairs(container)
+            if _intersects(_rectangle(bubble), container_rect)
+        ]
+
+    @staticmethod
+    def _nodes_from_pairs(pairs) -> list[AccessibleNode]:
+        nodes = []
+        for marker, bubble in pairs:
             nodes.extend([_node(marker, max_depth=0), _node(bubble, max_depth=4)])
         return nodes
+
+    @classmethod
+    def _snapshot(cls, container) -> list[AccessibleNode]:
+        """Build only visible user nodes, not the entire conversation tree."""
+        return cls._nodes_from_pairs(cls._visible_pairs(container))
+
+    def _settled_page(
+        self,
+        container,
+        requested_percent: float,
+        settle_timeout: float,
+        cancelled=None,
+    ) -> tuple[list[Question], float, object]:
+        """Poll cheap direct children, then parse text once after UIA stabilizes."""
+        timeout = max(0.10, min(0.40, settle_timeout or 0.18))
+        minimum_settle = (
+            min(0.34, timeout * 0.9)
+            if requested_percent <= 0.01
+            else min(0.16, timeout * 0.6)
+        )
+        interval = 0.02
+        started = time.monotonic()
+        last_signature = None
+        latest_pairs = []
+        current = requested_percent
+        while True:
+            if cancelled is not None and cancelled():
+                raise ScanCancelled("用户已取消扫描")
+            try:
+                current = self.scroll_percent(container)
+                if _transient_end_jump(requested_percent, current):
+                    self.set_scroll_percent(container, requested_percent)
+                    last_signature = None
+                else:
+                    latest_pairs = self._visible_pairs(container)
+                    signature = _pair_signature(latest_pairs)
+                    elapsed = time.monotonic() - started
+                    if (
+                        signature == last_signature
+                        and elapsed >= minimum_settle
+                    ):
+                        break
+                    last_signature = signature
+            except Exception:
+                container = self.find_thread_container()
+                last_signature = None
+
+            elapsed = time.monotonic() - started
+            if elapsed >= timeout:
+                break
+            time.sleep(interval)
+
+        page = parse_direct_children(
+            self._nodes_from_pairs(latest_pairs), current
+        )
+        return page, current, container
 
     def conversation_title(self, window, container) -> str:
         container_rect = _rectangle(container)
         window_rect = _rectangle(window)
-        for element in window.descendants(control_type="Button"):
+        selected_buttons = []
+        if self._cached_selected_title_class:
             try:
-                tokens = set((element.element_info.class_name or "").split())
+                selected_buttons = window.descendants(
+                    control_type="Button",
+                    class_name=self._cached_selected_title_class,
+                )
+            except Exception:
+                selected_buttons = []
+        if not selected_buttons:
+            selected_buttons = window.descendants(control_type="Button")
+        for element in selected_buttons:
+            try:
+                class_name = element.element_info.class_name or ""
+                tokens = set(class_name.split())
                 name = (element.element_info.name or "").strip()
                 if (
                     name
                     and "sidebar-item" in tokens
                     and "bg-token-list-hover-background" in tokens
                 ):
+                    type(self)._cached_selected_title_class = class_name
                     return name
             except Exception:
                 continue
@@ -283,45 +428,39 @@ class WindowsUIA:
                 continue
         return min(candidates, default=(0, ""), key=lambda item: item[0])[1]
 
-    def scan(self, pause_seconds: float = 0.18) -> ConversationIndex:
+    def scan(
+        self,
+        pause_seconds: float = 0.12,
+        progress_callback=None,
+        cancelled=None,
+    ) -> ConversationIndex:
         window = self.find_window()
         container = self.find_thread_container(window)
         original = self.scroll_percent(container)
         title = self.conversation_title(window, container)
         questions: list[Question] = []
+        positions: dict[str, int] = {}
         try:
             self.set_scroll_percent(container, 0.0)
-            time.sleep(pause_seconds)
             percent = 0.0
-            stagnant = 0
-            while True:
-                page = []
-                for attempt in range(3):
-                    window = self.find_window()
-                    container = self.find_thread_container(window)
-                    current = self.scroll_percent(container)
-                    if _transient_end_jump(percent, current):
-                        self.set_scroll_percent(container, percent)
-                        time.sleep(max(0.03, pause_seconds))
-                        continue
-                    observed = parse_direct_children(
-                        self._snapshot(container), current
+            for _page_number in range(256):
+                page_timeout = (
+                    max(0.40, pause_seconds)
+                    if percent <= 0.01
+                    else pause_seconds
+                )
+                page, current, container = self._settled_page(
+                    container,
+                    percent,
+                    page_timeout,
+                    cancelled,
+                )
+                added = _accumulate_questions(questions, positions, page)
+                if progress_callback is not None:
+                    progress_callback(
+                        min(100.0, max(percent, current)),
+                        len(questions),
                     )
-                    # The first non-empty children list can still describe the
-                    # previous virtual page. Treat it as a materialization
-                    # primer and accept a later observation from the same
-                    # scroll position.
-                    if attempt > 0 and (observed or attempt == 2):
-                        page = observed
-                        break
-                    # Empty pages can be legitimate between long assistant
-                    # answers, but Chromium also briefly exposes stale or empty
-                    # children while replacing a virtual page. Settle in place
-                    # before advancing so short user questions are not skipped.
-                    time.sleep(max(0.03, pause_seconds))
-                before = len(questions)
-                questions = merge_questions(questions, page)
-                stagnant = stagnant + 1 if len(questions) == before else 0
                 if percent >= 99.0 and current >= 99.0:
                     break
                 try:
@@ -338,15 +477,23 @@ class WindowsUIA:
                     100.0, max(percent + step, stable_current + 3.0)
                 )
                 self.set_scroll_percent(container, percent)
-                time.sleep(pause_seconds)
-                if percent >= 100.0 and stagnant >= 2:
-                    break
+                if percent >= 100.0 and added == 0:
+                    # One final settled read at 100% is still required.
+                    continue
+            else:
+                raise RuntimeError("扫描页数超过安全上限，已停止")
         finally:
             try:
-                self.set_scroll_percent(self.find_thread_container(), original)
+                self.set_scroll_percent(container, original)
             except Exception:
-                LOGGER.exception("failed to restore scroll position")
+                try:
+                    self.set_scroll_percent(
+                        self.find_thread_container(), original
+                    )
+                except Exception:
+                    LOGGER.exception("failed to restore scroll position")
 
+        questions = merge_questions([], questions)
         first = questions[0].text if questions else ""
         fingerprint = hashlib.sha256(
             f"{window.window_text()}|{title}|{first}".encode("utf-8")
@@ -362,21 +509,36 @@ class WindowsUIA:
             updated_at=datetime.now(timezone.utc).isoformat(),
         )
 
-    def visible_questions(self) -> list[Question]:
-        container = self.find_thread_container()
-        return parse_direct_children(
-            self._snapshot(container), self.scroll_percent(container)
+    def visible_snapshot(self) -> ConversationSnapshot:
+        window = self.find_window()
+        container = self.find_thread_container(window)
+        current = self.scroll_percent(container)
+        questions = parse_direct_children(
+            self._snapshot(container), current
+        )
+        return ConversationSnapshot(
+            window_title=window.window_text() or "ChatGPT",
+            conversation_title="",
+            questions=questions,
+            container_id=_runtime_id(container),
         )
 
     def probe(self) -> ConversationSnapshot:
         window = self.find_window()
         container = self.find_thread_container(window)
+        _thread_id, process_id = win32process.GetWindowThreadProcessId(
+            window.handle
+        )
+        requested = self.scroll_percent(container)
+        questions, _current, container = self._settled_page(
+            container, requested, 0.12
+        )
         return ConversationSnapshot(
             window_title=window.window_text() or "ChatGPT",
             conversation_title=self.conversation_title(window, container),
-            questions=parse_direct_children(
-                self._snapshot(container), self.scroll_percent(container)
-            ),
+            questions=questions,
+            container_id=_runtime_id(container),
+            process_id=process_id,
         )
 
     @staticmethod

@@ -64,3 +64,5 @@ class ConversationSnapshot:
     window_title: str
     conversation_title: str
     questions: list[Question] = field(default_factory=list)
+    container_id: str = ""
+    process_id: int = 0

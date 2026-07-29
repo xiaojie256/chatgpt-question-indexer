@@ -46,6 +46,7 @@ from .models import (
 from .parser import merge_questions
 from .windows_uia import (
     ChatGPTDock,
+    ScanCancelled,
     WindowsUIA,
     is_window_cloaked,
     process_is_elevated,
@@ -64,6 +65,8 @@ LOGGER = logging.getLogger(__name__)
 class ScanWorker(QThread):
     completed = Signal(object)
     failed = Signal(str)
+    cancelled = Signal()
+    progress = Signal(float, int)
 
     def __init__(self, mode: str, pause: float = 0):
         super().__init__()
@@ -74,8 +77,19 @@ class ScanWorker(QThread):
         pythoncom.CoInitialize()
         try:
             uia = WindowsUIA()
-            result = uia.scan(self.pause) if self.mode == "full" else uia.probe()
+            if self.mode == "full":
+                result = uia.scan(
+                    self.pause,
+                    self.progress.emit,
+                    self.isInterruptionRequested,
+                )
+            elif self.mode == "visible":
+                result = uia.visible_snapshot()
+            else:
+                result = uia.probe()
             self.completed.emit(result)
+        except ScanCancelled:
+            self.cancelled.emit()
         except Exception as exc:
             LOGGER.exception("accessibility scan failed")
             self.failed.emit(f"{type(exc).__name__}: {exc}")
@@ -163,7 +177,7 @@ class HotkeyThread(QThread):
 class AccessibilityEventThread(QThread):
     """Listen for WinEvent accessibility changes from the ChatGPT process."""
 
-    changed = Signal()
+    changed = Signal(bool)
 
     def __init__(self, process_id: int):
         super().__init__()
@@ -184,15 +198,33 @@ class AccessibilityEventThread(QThread):
             wintypes.DWORD,
             wintypes.DWORD,
         )
+        last_fast_emit = 0.0
+        last_slow_emit = 0.0
 
-        def on_event(_hook, event, _hwnd, object_id, _child_id, _thread, _time):
+        def on_event(
+            _hook,
+            event,
+            _hwnd,
+            object_id,
+            _child_id,
+            _thread,
+            _event_time,
+        ):
+            nonlocal last_fast_emit, last_slow_emit
             if event in {
                 0x8000,  # EVENT_OBJECT_CREATE
                 0x8002,  # EVENT_OBJECT_SHOW
-                0x800C,  # EVENT_OBJECT_NAMECHANGE
+                0x8004,  # EVENT_OBJECT_REORDER
                 0x800E,  # EVENT_OBJECT_VALUECHANGE
             } and object_id != -8:  # ignore caret-only churn
-                self.changed.emit()
+                now = time.monotonic()
+                immediate = event in {0x8000, 0x8002, 0x8004}
+                if immediate and now - last_fast_emit >= 0.08:
+                    last_fast_emit = now
+                    self.changed.emit(True)
+                elif not immediate and now - last_slow_emit >= 0.30:
+                    last_slow_emit = now
+                    self.changed.emit(False)
 
         self._callback = callback_type(on_event)
         hook = user32.SetWinEventHook(
@@ -243,6 +275,8 @@ class QuestionListWidget(QListWidget):
 
 
 class Sidebar(QMainWindow):
+    chatgpt_process_changed = Signal(int)
+
     def __init__(self, config: dict):
         super().__init__()
         self.config = config
@@ -254,13 +288,19 @@ class Sidebar(QMainWindow):
         )
         self.index: ConversationIndex | None = None
         self.worker: QThread | None = None
+        self.worker_mode = ""
         self.busy = False
         self.collapsed = False
         self.force_quit = False
         self.last_jump_mode = "尚未跳转"
         self.pending_rebuild = False
+        self.pending_probe = False
+        self.pending_visible_refresh = False
         self.pending_jump_position: int | None = None
         self.active_jump_position: int | None = None
+        self.active_container_id = ""
+        self.cache_dirty = False
+        self.last_visible_capture_at = 0.0
         self.highlighted_item: QListWidgetItem | None = None
         self.suppress_refresh_until = 0.0
         self.dock = ChatGPTDock()
@@ -288,8 +328,15 @@ class Sidebar(QMainWindow):
         )
         self.event_debounce = QTimer(self)
         self.event_debounce.setSingleShot(True)
-        self.event_debounce.setInterval(1200)
+        self.event_debounce.setInterval(700)
         self.event_debounce.timeout.connect(self.refresh_current)
+        self.visible_capture_timer = QTimer(self)
+        self.visible_capture_timer.setSingleShot(True)
+        self.visible_capture_timer.timeout.connect(self.refresh_visible)
+        self.cache_save_timer = QTimer(self)
+        self.cache_save_timer.setSingleShot(True)
+        self.cache_save_timer.setInterval(1500)
+        self.cache_save_timer.timeout.connect(self._flush_cache)
         self.highlight_timer = QTimer(self)
         self.highlight_timer.setSingleShot(True)
         self.highlight_timer.timeout.connect(self._clear_jump_highlight)
@@ -407,23 +454,44 @@ class Sidebar(QMainWindow):
         )
 
     def rebuild(self) -> None:
-        if self.busy or not self.on_launch_desktop():
+        if not self.on_launch_desktop():
             return
+        if self.busy:
+            if self.worker_mode == "full" and isinstance(
+                self.worker, ScanWorker
+            ):
+                self.worker.requestInterruption()
+                self.rebuild_button.setEnabled(False)
+                self.status.setText("正在停止重建并恢复原滚动位置…")
+            else:
+                self.pending_rebuild = True
+                self.status.setText("已安排在当前操作结束后重建索引")
+            return
+        self.pending_rebuild = False
         self.busy = True
-        self.rebuild_button.setEnabled(False)
-        self.status.setText("正在从顶部扫描到尾部，并将在完成后恢复滚动位置…")
-        pause = float(self.config.get("scan_pause_ms", 180)) / 1000.0
+        self.worker_mode = "full"
+        self.rebuild_button.setText("停止")
+        self.rebuild_button.setEnabled(True)
+        self.status.setText("正在重建：0% · 已发现 0 条；再次点击可停止")
+        pause = float(self.config.get("scan_pause_ms", 120)) / 1000.0
         worker = ScanWorker("full", pause)
         worker.completed.connect(self._full_scan_done)
         worker.failed.connect(self._worker_failed)
+        worker.cancelled.connect(self._scan_cancelled)
+        worker.progress.connect(self._scan_progress)
         worker.finished.connect(self._worker_finished)
         self.worker = worker
         worker.start()
 
     def refresh_current(self) -> None:
-        if self.busy or not self.on_launch_desktop():
+        if not self.on_launch_desktop():
             return
+        if self.busy:
+            self.pending_probe = True
+            return
+        self.pending_probe = False
         self.busy = True
+        self.worker_mode = "probe"
         worker = ScanWorker("probe")
         worker.completed.connect(self._probe_done)
         worker.failed.connect(self._worker_failed)
@@ -431,12 +499,56 @@ class Sidebar(QMainWindow):
         self.worker = worker
         worker.start()
 
-    def accessibility_changed(self) -> None:
+    def refresh_visible(self) -> None:
+        if (
+            not self.on_launch_desktop()
+            or time.monotonic() < self.suppress_refresh_until
+        ):
+            return
+        if self.busy:
+            self.pending_visible_refresh = True
+            return
+        self.visible_capture_timer.stop()
+        self.pending_visible_refresh = False
+        self.last_visible_capture_at = time.monotonic()
+        self.busy = True
+        self.worker_mode = "visible"
+        worker = ScanWorker("visible")
+        worker.completed.connect(self._visible_done)
+        worker.failed.connect(self._worker_failed)
+        worker.finished.connect(self._worker_finished)
+        self.worker = worker
+        worker.start()
+
+    def accessibility_changed(self, immediate: bool = False) -> None:
         if (
             time.monotonic() >= self.suppress_refresh_until
             and self.on_launch_desktop()
         ):
             self.event_debounce.start()
+            if immediate:
+                self._request_visible_capture()
+
+    def _request_visible_capture(self) -> None:
+        if self.busy:
+            self.pending_visible_refresh = True
+            return
+        elapsed = time.monotonic() - self.last_visible_capture_at
+        minimum_interval = 0.10
+        if elapsed >= minimum_interval:
+            self.refresh_visible()
+            return
+        remaining_ms = max(1, int((minimum_interval - elapsed) * 1000))
+        if not self.visible_capture_timer.isActive():
+            self.visible_capture_timer.start(remaining_ms)
+
+    def _scan_progress(self, percent: float, count: int) -> None:
+        self.status.setText(
+            f"正在重建：{percent:.0f}% · 已发现 {count} 条；再次点击可停止"
+        )
+
+    def _scan_cancelled(self) -> None:
+        self.status.setText("已停止重建，并恢复到开始前的滚动位置")
 
     def _full_scan_done(self, index: ConversationIndex) -> None:
         if not index.questions:
@@ -445,13 +557,14 @@ class Sidebar(QMainWindow):
             )
             return
         self.index = index
+        self.pending_visible_refresh = False
+        self.cache_dirty = False
         path = self.cache.save(index)
-        for question in index.questions:
-            LOGGER.info(
-                "indexed message hash=%s length=%d",
-                question.text_hash[:16],
-                len(question.text),
-            )
+        LOGGER.info(
+            "indexed conversation questions=%d fingerprint=%s",
+            len(index.questions),
+            index.fingerprint,
+        )
         self.render()
         self.status.setText(
             f"已读取 {len(index.questions)} 条用户提问 · 精确跳转可用"
@@ -467,27 +580,46 @@ class Sidebar(QMainWindow):
             return False
         if snapshot.window_title != self.index.window_title:
             return False
+        if (
+            snapshot.container_id
+            and self.active_container_id
+            and snapshot.container_id != self.active_container_id
+        ):
+            return False
         return (
             not snapshot.conversation_title
             or snapshot.conversation_title == self.index.conversation_title
         )
 
-    def _merge_snapshot(self, snapshot: ConversationSnapshot) -> bool:
+    def _merge_snapshot(
+        self,
+        snapshot: ConversationSnapshot,
+        *,
+        preserve_existing_position: bool = True,
+    ) -> int:
         if self.index is None:
-            return False
+            return 0
         before = len(self.index.questions)
         self.index.questions = merge_questions(
             self.index.questions,
             snapshot.questions,
-            preserve_existing_position=True,
+            preserve_existing_position=preserve_existing_position,
         )
-        return len(self.index.questions) != before
+        added = len(self.index.questions) - before
+        if added:
+            self.cache_dirty = True
+            self.cache_save_timer.start()
+        return added
 
     def _probe_done(self, snapshot: ConversationSnapshot) -> None:
+        if snapshot.process_id:
+            self.chatgpt_process_changed.emit(snapshot.process_id)
         if self._same_conversation(snapshot):
-            if self._merge_snapshot(snapshot):
-                self.cache.save(self.index)
-                self.render()
+            if snapshot.container_id:
+                self.active_container_id = snapshot.container_id
+            added = self._merge_snapshot(snapshot)
+            if added:
+                self._append_items(len(self.index.questions) - added)
                 self.status.setText(
                     f"已自动追加，当前 {len(self.index.questions)} 条用户提问"
                 )
@@ -496,20 +628,21 @@ class Sidebar(QMainWindow):
         if not snapshot.conversation_title:
             self.status.setText("暂时无法确认当前对话，稍后重试")
             return
+        self._flush_cache()
         cached = self.cache.load_for_conversation(
             snapshot.window_title, snapshot.conversation_title
         )
         if cached is None or cached.scroll_mode != CURRENT_SCROLL_MODE:
             self.index = None
+            self.active_container_id = snapshot.container_id
             self.list_widget.clear()
             self.status.setText("索引缺失或格式已升级，准备后台重新建立…")
             self.pending_rebuild = True
             return
 
         self.index = cached
-        changed = self._merge_snapshot(snapshot)
-        if changed:
-            self.cache.save(self.index)
+        self.active_container_id = snapshot.container_id
+        self._merge_snapshot(snapshot)
         self.render()
         count, size = self.cache.stats()
         self.status.setText(
@@ -517,14 +650,41 @@ class Sidebar(QMainWindow):
             f"缓存 {count} 个/{size / 1024:.0f} KiB"
         )
 
+    def _visible_done(self, snapshot: ConversationSnapshot) -> None:
+        if (
+            self.index is None
+            or not self.active_container_id
+            or snapshot.container_id != self.active_container_id
+        ):
+            self.pending_probe = True
+            return
+        added = self._merge_snapshot(
+            snapshot, preserve_existing_position=True
+        )
+        if added:
+            self._append_items(len(self.index.questions) - added)
+            self.status.setText(
+                f"滚动中已捕获新提问，当前 {len(self.index.questions)} 条"
+            )
+
+    def _flush_cache(self) -> None:
+        if self.cache_dirty and self.index is not None:
+            self.cache.save(self.index)
+            self.cache_dirty = False
+
     def _worker_failed(self, message: str) -> None:
         self.status.setText(f"无障碍访问失败：{message}")
 
     def _worker_finished(self) -> None:
         worker = self.sender()
+        completed_mode = self.worker_mode
         if isinstance(worker, JumpWorker):
             self.active_jump_position = None
+        if completed_mode == "full":
+            self.pending_visible_refresh = False
         self.busy = False
+        self.worker_mode = ""
+        self.rebuild_button.setText("重建")
         self.rebuild_button.setEnabled(True)
         self.worker = None
         if isinstance(worker, QThread):
@@ -537,12 +697,30 @@ class Sidebar(QMainWindow):
         if self.pending_rebuild:
             self.pending_rebuild = False
             QTimer.singleShot(0, self.rebuild)
+            return
+        if self.pending_probe:
+            self.pending_probe = False
+            QTimer.singleShot(0, self.refresh_current)
+            return
+        if (
+            self.pending_visible_refresh
+            and completed_mode != "full"
+            and time.monotonic() >= self.suppress_refresh_until
+        ):
+            self.pending_visible_refresh = False
+            QTimer.singleShot(0, self._request_visible_capture)
 
     def render(self) -> None:
+        self._clear_jump_highlight()
         self.list_widget.clear()
         if self.index is None:
             return
-        for question in self.index.questions:
+        self._append_items(0)
+
+    def _append_items(self, start: int) -> None:
+        if self.index is None:
+            return
+        for question in self.index.questions[start:]:
             item = QListWidgetItem(f"{question.number}. {question.summary}")
             item.setData(Qt.ItemDataRole.UserRole, question.number - 1)
             self.list_widget.addItem(item)
@@ -592,6 +770,7 @@ class Sidebar(QMainWindow):
         if item is not None:
             self._highlight_jump_item(item)
         self.busy = True
+        self.worker_mode = "jump"
         self.active_jump_position = position
         self.event_debounce.stop()
         self.suppress_refresh_until = time.monotonic() + 1.5
@@ -643,11 +822,17 @@ class Sidebar(QMainWindow):
         if result != QMessageBox.StandardButton.Yes:
             return
         count = self.cache.clear()
+        self.cache_dirty = False
+        self.cache_save_timer.stop()
         self.index = None
+        self.active_container_id = ""
         self.list_widget.clear()
         self.status.setText(f"已清除 {count} 个本地索引文件")
 
     def quit_application(self) -> None:
+        self._flush_cache()
+        if isinstance(self.worker, ScanWorker):
+            self.worker.requestInterruption()
         self.force_quit = True
         if self.config.get("restore_chatgpt_geometry_on_exit", True):
             self.dock.restore()
@@ -727,9 +912,29 @@ def main() -> int:
     hotkeys.registration_failed.connect(sidebar.status.setText)
     hotkeys.start()
     events = AccessibilityEventThread(details.process_id)
+
+    def rebind_accessibility_events(process_id: int) -> None:
+        nonlocal events
+        if process_id <= 0 or process_id == events.process_id:
+            return
+        LOGGER.info(
+            "ChatGPT process changed from %d to %d; rebinding events",
+            events.process_id,
+            process_id,
+        )
+        events.stop()
+        events = AccessibilityEventThread(process_id)
+        events.changed.connect(sidebar.accessibility_changed)
+        events.start()
+
+    sidebar.chatgpt_process_changed.connect(rebind_accessibility_events)
     events.changed.connect(sidebar.accessibility_changed)
     events.start()
     result = application.exec()
+    if isinstance(sidebar.worker, QThread):
+        if isinstance(sidebar.worker, ScanWorker):
+            sidebar.worker.requestInterruption()
+        sidebar.worker.wait(3000)
     events.stop()
     hotkeys.stop()
     if config.get("restore_chatgpt_geometry_on_exit", True):
