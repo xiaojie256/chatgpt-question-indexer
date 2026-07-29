@@ -92,12 +92,19 @@ def parse_direct_children(
     return found
 
 
-def merge_questions(existing: list[Question], incoming: list[Question]) -> list[Question]:
+def merge_questions(
+    existing: list[Question],
+    incoming: list[Question],
+    *,
+    preserve_existing_position: bool = False,
+) -> list[Question]:
     by_hash = {question.text_hash: question for question in existing}
     order = [question.text_hash for question in existing]
     for question in incoming:
         if question.text_hash not in by_hash:
             order.append(question.text_hash)
+        elif preserve_existing_position:
+            question.scroll_percent = by_hash[question.text_hash].scroll_percent
         by_hash[question.text_hash] = question
     merged = [by_hash[digest] for digest in order]
     for index, question in enumerate(merged):

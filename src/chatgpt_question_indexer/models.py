@@ -4,6 +4,9 @@ from dataclasses import asdict, dataclass, field
 from typing import Any
 
 
+CURRENT_SCROLL_MODE = "exact-v2"
+
+
 @dataclass(slots=True)
 class Question:
     text: str

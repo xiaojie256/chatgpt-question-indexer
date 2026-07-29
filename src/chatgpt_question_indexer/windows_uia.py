@@ -11,7 +11,12 @@ import win32con
 import win32gui
 import win32process
 
-from .models import ConversationIndex, ConversationSnapshot, Question
+from .models import (
+    CURRENT_SCROLL_MODE,
+    ConversationIndex,
+    ConversationSnapshot,
+    Question,
+)
 from .parser import (
     ASSISTANT_MARKERS,
     USER_MARKERS,
@@ -66,6 +71,43 @@ def _node(wrapper, depth: int = 0, max_depth: int = 12) -> AccessibleNode:
         class_name=info.class_name or "",
         children=children,
     )
+
+
+def _nearby_indexes(position: int, count: int, radius: int = 3) -> list[int]:
+    """Return the indexed message first, followed by nearby fallback positions."""
+    if count <= 0:
+        return []
+    position = max(0, min(count - 1, position))
+    indexes = [position]
+    for distance in range(1, radius + 1):
+        before = position - distance
+        after = position + distance
+        if before >= 0:
+            indexes.append(before)
+        if after < count:
+            indexes.append(after)
+    return indexes
+
+
+def _intersects(
+    first: tuple[int, int, int, int], second: tuple[int, int, int, int]
+) -> bool:
+    return (
+        first[0] < second[2]
+        and first[2] > second[0]
+        and first[1] < second[3]
+        and first[3] > second[1]
+    )
+
+
+def _scan_step(view_size: float) -> float:
+    """Advance with enough overlap to catch short bubbles between long answers."""
+    return max(3.0, min(25.0, view_size * 0.65))
+
+
+def _transient_end_jump(requested: float, current: float) -> bool:
+    """Detect Chromium briefly reporting the bottom during mid-scan updates."""
+    return requested < 95.0 and current >= 99.0
 
 
 class WindowsUIA:
@@ -161,7 +203,17 @@ class WindowsUIA:
 
     @staticmethod
     def _message_pairs(container) -> list[tuple[object, object]]:
-        children = container.children()
+        last_error = None
+        for attempt in range(3):
+            try:
+                children = container.children()
+                break
+            except Exception as exc:
+                last_error = exc
+                if attempt < 2:
+                    time.sleep(0.02)
+        else:
+            raise last_error or RuntimeError("无法读取对话消息节点")
         pairs = []
         for index, marker in enumerate(children):
             try:
@@ -188,7 +240,13 @@ class WindowsUIA:
     def _snapshot(cls, container) -> list[AccessibleNode]:
         """Build only user marker/bubble nodes, not the entire conversation tree."""
         nodes = []
+        container_rect = _rectangle(container)
         for marker, bubble in cls._message_pairs(container):
+            # Chromium keeps some virtualized/off-screen messages in the UIA
+            # tree. Recording them on every scan page collapses all saved
+            # percentages toward the final page and ruins fallback accuracy.
+            if not _intersects(_rectangle(bubble), container_rect):
+                continue
             nodes.extend([_node(marker, max_depth=0), _node(bubble, max_depth=4)])
         return nodes
 
@@ -237,21 +295,48 @@ class WindowsUIA:
             percent = 0.0
             stagnant = 0
             while True:
-                window = self.find_window()
-                container = self.find_thread_container(window)
-                current = self.scroll_percent(container)
-                page = parse_direct_children(self._snapshot(container), current)
+                page = []
+                for attempt in range(3):
+                    window = self.find_window()
+                    container = self.find_thread_container(window)
+                    current = self.scroll_percent(container)
+                    if _transient_end_jump(percent, current):
+                        self.set_scroll_percent(container, percent)
+                        time.sleep(max(0.03, pause_seconds))
+                        continue
+                    observed = parse_direct_children(
+                        self._snapshot(container), current
+                    )
+                    # The first non-empty children list can still describe the
+                    # previous virtual page. Treat it as a materialization
+                    # primer and accept a later observation from the same
+                    # scroll position.
+                    if attempt > 0 and (observed or attempt == 2):
+                        page = observed
+                        break
+                    # Empty pages can be legitimate between long assistant
+                    # answers, but Chromium also briefly exposes stale or empty
+                    # children while replacing a virtual page. Settle in place
+                    # before advancing so short user questions are not skipped.
+                    time.sleep(max(0.03, pause_seconds))
                 before = len(questions)
                 questions = merge_questions(questions, page)
                 stagnant = stagnant + 1 if len(questions) == before else 0
-                if current >= 99.0:
+                if percent >= 99.0 and current >= 99.0:
                     break
                 try:
                     view_size = float(container.iface_scroll.CurrentVerticalViewSize)
                 except Exception:
                     view_size = 20.0
-                step = max(8.0, min(35.0, view_size * 0.8))
-                percent = min(100.0, max(percent + step, current + 3.0))
+                step = _scan_step(view_size)
+                stable_current = (
+                    percent
+                    if _transient_end_jump(percent, current)
+                    else current
+                )
+                percent = min(
+                    100.0, max(percent + step, stable_current + 3.0)
+                )
                 self.set_scroll_percent(container, percent)
                 time.sleep(pause_seconds)
                 if percent >= 100.0 and stagnant >= 2:
@@ -273,7 +358,7 @@ class WindowsUIA:
             window_title=window.window_text() or "ChatGPT",
             conversation_title=title,
             questions=questions,
-            scroll_mode="exact",
+            scroll_mode=CURRENT_SCROLL_MODE,
             updated_at=datetime.now(timezone.utc).isoformat(),
         )
 
@@ -294,42 +379,109 @@ class WindowsUIA:
             ),
         )
 
-    def _find_live_message(self, container, question: Question):
-        pairs = self._message_pairs(container)
-        for _marker, bubble in pairs:
-            if question.element_id and _runtime_id(bubble) == question.element_id:
-                return bubble
+    @staticmethod
+    def _matches_question(marker, bubble, question: Question, percent: float) -> bool:
+        try:
+            parsed = parse_direct_children(
+                [_node(marker, max_depth=0), _node(bubble, max_depth=4)],
+                percent,
+            )
+            return bool(parsed and parsed[0].text_hash == question.text_hash)
+        except Exception:
+            return False
+
+    def _find_live_message(self, container, question: Question, pairs=None):
+        """Find a message without hashing every question in a long conversation."""
+        pairs = pairs if pairs is not None else self._message_pairs(container)
         for marker, bubble in pairs:
+            if question.element_id and _runtime_id(bubble) == question.element_id:
+                return marker, bubble
+
+        percent = self.scroll_percent(container)
+        checked: set[int] = set()
+        expected = max(0, question.number - 1)
+        candidate_indexes = _nearby_indexes(expected, len(pairs))
+        container_rect = _rectangle(container)
+        candidate_indexes.extend(
+            index
+            for index, (_marker, bubble) in enumerate(pairs)
+            if _intersects(_rectangle(bubble), container_rect)
+        )
+        for index in candidate_indexes:
+            if index in checked:
+                continue
+            checked.add(index)
+            marker, bubble = pairs[index]
+            if self._matches_question(marker, bubble, question, percent):
+                return marker, bubble
+        return None
+
+    @staticmethod
+    def _first_text_anchor(wrapper, max_depth: int = 7):
+        """Return the first text leaf so long questions jump to their beginning."""
+        stack = [(wrapper, 0)]
+        while stack:
+            current, depth = stack.pop()
             try:
-                parsed = parse_direct_children(
-                    [_node(marker, max_depth=0), _node(bubble, max_depth=4)],
-                    self.scroll_percent(container),
-                )
-                if parsed and parsed[0].text_hash == question.text_hash:
-                    return bubble
+                if (
+                    current.element_info.control_type in {"Text", "Edit", "ListItem"}
+                    and (current.element_info.name or "").strip()
+                ):
+                    return current
+                if depth < max_depth:
+                    stack.extend(
+                        (child, depth + 1)
+                        for child in reversed(current.children())
+                    )
             except Exception:
                 continue
-        return None
+        return wrapper
+
+    @classmethod
+    def _scroll_message_into_view(cls, bubble) -> None:
+        anchor = cls._first_text_anchor(bubble)
+        try:
+            anchor.iface_scroll_item.ScrollIntoView()
+        except Exception:
+            bubble.iface_scroll_item.ScrollIntoView()
 
     def jump(self, question: Question) -> str:
         container = self.find_thread_container()
-        live = self._find_live_message(container, question)
-        if live is not None:
-            try:
-                live.iface_scroll_item.ScrollIntoView()
-                return "exact"
-            except Exception:
-                LOGGER.exception("ScrollIntoView failed; using percentage")
+        current = self.scroll_percent(container)
+        distance = abs(current - question.scroll_percent)
+        # Only inspect the current page when it is already near the target.
+        # Searching a virtualized page that clearly cannot contain the target
+        # adds latency without improving accuracy.
+        if distance <= 1.0:
+            live = self._find_live_message(container, question)
+            if live is not None:
+                try:
+                    self._scroll_message_into_view(live[1])
+                    return "exact"
+                except Exception:
+                    LOGGER.exception("ScrollIntoView failed; using percentage")
 
-        self.set_scroll_percent(container, question.scroll_percent)
-        time.sleep(0.06)
-        live = self._find_live_message(container, question)
-        if live is not None:
-            try:
-                live.iface_scroll_item.ScrollIntoView()
-                return "percentage+refine"
-            except Exception:
-                pass
+        if distance > 0.05:
+            self.set_scroll_percent(container, question.scroll_percent)
+            time.sleep(0.025)
+            # Chromium replaces virtualized UIA nodes asynchronously. A fresh
+            # wrapper is required; reusing the pre-scroll wrapper can expose
+            # stale children and incorrectly stop at percentage-only mode.
+            container = self.find_thread_container()
+        # Chromium may expose one or two stale child snapshots while it
+        # virtualizes the destination page. Poll the small direct-child list
+        # with a strict bound; never fall back to a full-tree search.
+        for attempt in range(3):
+            pairs = self._message_pairs(container)
+            live = self._find_live_message(container, question, pairs)
+            if live is not None:
+                try:
+                    self._scroll_message_into_view(live[1])
+                    return "percentage+refine"
+                except Exception:
+                    break
+            if attempt < 2:
+                time.sleep(0.025)
         return "percentage"
 
 

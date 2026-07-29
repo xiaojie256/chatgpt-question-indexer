@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import ctypes
-import gc
 import json
 import logging
 import platform
 import sys
+import time
 import warnings
 from ctypes import wintypes
 from logging.handlers import RotatingFileHandler
@@ -20,6 +20,7 @@ from PySide6.QtCore import QEvent, QThread, QTimer, Qt, Signal
 from PySide6.QtGui import QAction, QCloseEvent, QIcon
 from PySide6.QtWidgets import (
     QApplication,
+    QAbstractItemView,
     QHBoxLayout,
     QLabel,
     QListWidget,
@@ -36,7 +37,12 @@ from PySide6.QtWidgets import (
 )
 
 from .cache import IndexCache
-from .models import ConversationIndex, ConversationSnapshot, Question
+from .models import (
+    CURRENT_SCROLL_MODE,
+    ConversationIndex,
+    ConversationSnapshot,
+    Question,
+)
 from .parser import merge_questions
 from .windows_uia import (
     ChatGPTDock,
@@ -253,6 +259,10 @@ class Sidebar(QMainWindow):
         self.force_quit = False
         self.last_jump_mode = "尚未跳转"
         self.pending_rebuild = False
+        self.pending_jump_position: int | None = None
+        self.active_jump_position: int | None = None
+        self.highlighted_item: QListWidgetItem | None = None
+        self.suppress_refresh_until = 0.0
         self.dock = ChatGPTDock()
 
         self.setWindowTitle("ChatGPT 提问导航")
@@ -280,6 +290,9 @@ class Sidebar(QMainWindow):
         self.event_debounce.setSingleShot(True)
         self.event_debounce.setInterval(1200)
         self.event_debounce.timeout.connect(self.refresh_current)
+        self.highlight_timer = QTimer(self)
+        self.highlight_timer.setSingleShot(True)
+        self.highlight_timer.timeout.connect(self._clear_jump_highlight)
 
     def _build_ui(self) -> None:
         root = QWidget()
@@ -311,6 +324,9 @@ class Sidebar(QMainWindow):
 
         self.list_widget = QuestionListWidget(self.question_at)
         self.list_widget.itemClicked.connect(self.jump_to_item)
+        self.list_widget.setSelectionMode(
+            QAbstractItemView.SelectionMode.NoSelection
+        )
         self.list_widget.setHorizontalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         )
@@ -416,10 +432,18 @@ class Sidebar(QMainWindow):
         worker.start()
 
     def accessibility_changed(self) -> None:
-        if self.on_launch_desktop():
+        if (
+            time.monotonic() >= self.suppress_refresh_until
+            and self.on_launch_desktop()
+        ):
             self.event_debounce.start()
 
     def _full_scan_done(self, index: ConversationIndex) -> None:
+        if not index.questions:
+            self.status.setText(
+                "本次扫描未读取到用户提问，已保留原索引；请稍后重试"
+            )
+            return
         self.index = index
         path = self.cache.save(index)
         for question in index.questions:
@@ -453,7 +477,9 @@ class Sidebar(QMainWindow):
             return False
         before = len(self.index.questions)
         self.index.questions = merge_questions(
-            self.index.questions, snapshot.questions
+            self.index.questions,
+            snapshot.questions,
+            preserve_existing_position=True,
         )
         return len(self.index.questions) != before
 
@@ -473,10 +499,10 @@ class Sidebar(QMainWindow):
         cached = self.cache.load_for_conversation(
             snapshot.window_title, snapshot.conversation_title
         )
-        if cached is None:
+        if cached is None or cached.scroll_mode != CURRENT_SCROLL_MODE:
             self.index = None
             self.list_widget.clear()
-            self.status.setText("新对话尚无缓存，准备后台建立索引…")
+            self.status.setText("索引缺失或格式已升级，准备后台重新建立…")
             self.pending_rebuild = True
             return
 
@@ -496,12 +522,18 @@ class Sidebar(QMainWindow):
 
     def _worker_finished(self) -> None:
         worker = self.sender()
+        if isinstance(worker, JumpWorker):
+            self.active_jump_position = None
         self.busy = False
         self.rebuild_button.setEnabled(True)
         self.worker = None
         if isinstance(worker, QThread):
             worker.deleteLater()
-        gc.collect()
+        if self.pending_jump_position is not None:
+            position = self.pending_jump_position
+            self.pending_jump_position = None
+            QTimer.singleShot(0, lambda: self._start_jump(position))
+            return
         if self.pending_rebuild:
             self.pending_rebuild = False
             QTimer.singleShot(0, self.rebuild)
@@ -526,28 +558,83 @@ class Sidebar(QMainWindow):
         return self.index.questions[position]
 
     def jump_to_item(self, item: QListWidgetItem) -> None:
-        if self.busy or self.index is None:
+        if self.index is None:
             return
         position = item.data(Qt.ItemDataRole.UserRole)
-        if not isinstance(position, int) or position >= len(self.index.questions):
+        if (
+            not isinstance(position, int)
+            or position < 0
+            or position >= len(self.index.questions)
+        ):
             return
+        self._highlight_jump_item(item)
+        if self.busy:
+            if (
+                self.active_jump_position == position
+                and self.pending_jump_position is None
+            ):
+                self.status.setText(f"正在跳到第 {position + 1} 条…")
+                return
+            self.pending_jump_position = position
+            self.status.setText(f"已接收第 {position + 1} 条跳转，等待当前操作结束…")
+            return
+        self._start_jump(position)
+
+    def _start_jump(self, position: int) -> None:
+        if (
+            self.busy
+            or self.index is None
+            or position < 0
+            or position >= len(self.index.questions)
+        ):
+            return
+        item = self.list_widget.item(position)
+        if item is not None:
+            self._highlight_jump_item(item)
         self.busy = True
-        self.list_widget.setCurrentItem(item)
-        item.setBackground(self.palette().highlight())
+        self.active_jump_position = position
+        self.event_debounce.stop()
+        self.suppress_refresh_until = time.monotonic() + 1.5
+        self.status.setText(f"正在跳到第 {position + 1} 条…")
         worker = JumpWorker(self.index.questions[position])
-
-        def done(mode: str) -> None:
-            self.last_jump_mode = mode
-            self.status.setText(f"已跳到第 {position + 1} 条 · 模式：{mode}")
-            QTimer.singleShot(900, lambda: item.setBackground(Qt.GlobalColor.transparent))
-
-        worker.completed.connect(done)
+        worker.completed.connect(
+            lambda mode: self._jump_done(position, mode)
+        )
         worker.failed.connect(self._worker_failed)
         worker.finished.connect(self._worker_finished)
         self.worker = worker
         worker.start()
 
+    def _jump_done(self, position: int, mode: str) -> None:
+        self.last_jump_mode = mode
+        self.suppress_refresh_until = time.monotonic() + 1.0
+        self.status.setText(f"已跳到第 {position + 1} 条 · 模式：{mode}")
+        self.highlight_timer.start(650)
+
+    def _highlight_jump_item(self, item: QListWidgetItem) -> None:
+        self._clear_jump_highlight()
+        self.highlighted_item = item
+        item.setBackground(self.palette().highlight())
+        item.setForeground(self.palette().highlightedText())
+        self.highlight_timer.start(1200)
+
+    def _clear_jump_highlight(self) -> None:
+        if self.highlighted_item is not None:
+            try:
+                self.highlighted_item.setData(
+                    Qt.ItemDataRole.BackgroundRole, None
+                )
+                self.highlighted_item.setData(
+                    Qt.ItemDataRole.ForegroundRole, None
+                )
+            except RuntimeError:
+                pass
+        self.highlighted_item = None
+
     def clear_data(self) -> None:
+        if self.busy:
+            self.status.setText("当前操作完成后才能清除索引")
+            return
         result = QMessageBox.question(
             self,
             "清除全部索引数据",

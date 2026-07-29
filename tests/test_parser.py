@@ -60,6 +60,23 @@ def test_merge_deduplicates_across_virtualized_pages():
     assert merged[0].scroll_percent == 50
 
 
+def test_probe_merge_preserves_scanned_scroll_position():
+    page = [
+        node("Text", "You said:", class_name="sr-only select-none"),
+        node("Group", element_id="one", children=[node("Text", "同一条问题")]),
+    ]
+    scanned = parse_direct_children(page, 12.5)
+    visible_probe = parse_direct_children(page, 100)
+    merged = merge_questions(
+        scanned,
+        visible_probe,
+        preserve_existing_position=True,
+    )
+
+    assert merged[0].scroll_percent == 12.5
+    assert merged[0].element_id == "one"
+
+
 def test_summary_uses_fifty_characters():
     value = "问" * 60
     assert summarize(value) == "问" * 50 + "…"
