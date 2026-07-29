@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: Install dependencies
+        shell: pwsh
+        run: python -m pip install -r requirements-dev.txt
+      - name: Compile
+        shell: pwsh
+        run: python -m compileall -q src tests run.py diagnose_accessibility.py
+      - name: Test
+        shell: pwsh
+        run: |
+          $env:PYTHONPATH = ".\src"
+          python -m pytest -q

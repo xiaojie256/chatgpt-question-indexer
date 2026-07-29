@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Runtime data (may contain conversation text)
+data/
+logs/
+
+# Accessibility diagnostics (may contain conversation text)
+diagnostics/accessibility-tree.txt
+diagnostics/summary.json
+diagnostics/*.png
+
+# Build artifacts
+build/
+dist/
+*.spec
+*.zip
+
+# Editors and OS
+.idea/
+.vscode/
+*.swp
+Thumbs.db
+Desktop.ini
+
+# Local configuration overrides
+config.local.json

@@ -1,0 +1,15 @@
+{
+  "sidebar_width": 280,
+  "collapsed_width": 46,
+  "auto_refresh_seconds": 15,
+  "scan_pause_ms": 180,
+  "cache_max_conversations": 30,
+  "cache_max_megabytes": 25,
+  "cache_retention_days": 90,
+  "hotkeys": {
+    "toggle": "Ctrl+Shift+I",
+    "rebuild": "Ctrl+Shift+R"
+  },
+  "ocr_fallback_enabled": false,
+  "restore_chatgpt_geometry_on_exit": false
+}
