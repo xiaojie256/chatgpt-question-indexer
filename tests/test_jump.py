@@ -148,6 +148,36 @@ def test_message_pair_read_retries_transient_virtualization_failure():
     assert container.attempts == 2
 
 
+def test_message_pair_allows_many_attachments_before_bubble():
+    marker = FakeElement("Text", "你说：")
+    marker.element_info.class_name = "sr-only select-none"
+    attachments = [FakeElement("Button", f"file-{index}.cpp") for index in range(6)]
+    bubble = FakeElement("Group")
+    container = FakeElement(children=[marker, *attachments, bubble])
+
+    assert WindowsUIA._message_pairs(container) == [(marker, bubble)]
+
+
+def test_resilient_scroll_reacquires_invalid_container(monkeypatch):
+    stale = object()
+    fresh = object()
+    calls = []
+    uia = WindowsUIA()
+
+    def set_percent(container, percent):
+        calls.append((container, percent))
+        if container is stale:
+            raise RuntimeError("stale")
+
+    monkeypatch.setattr(uia, "set_scroll_percent", set_percent)
+    monkeypatch.setattr(uia, "find_thread_container", lambda: fresh)
+
+    result = uia._set_scroll_percent_resilient(stale, 42.0)
+
+    assert result is fresh
+    assert calls == [(stale, 42.0), (fresh, 42.0)]
+
+
 def test_live_message_checks_expected_ordinal_before_other_candidates(monkeypatch):
     pairs = [
         (FakeElement("Text", "You said:"), FakeElement())

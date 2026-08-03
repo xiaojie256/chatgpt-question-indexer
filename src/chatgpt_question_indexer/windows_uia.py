@@ -198,7 +198,7 @@ class WindowsUIA:
             rectangle=rect,
         )
 
-    def find_thread_container(self, window=None):
+    def _find_thread_container_once(self, window):
         window = window or self.find_window()
         candidates = []
         if self._cached_container_class:
@@ -238,6 +238,22 @@ class WindowsUIA:
             * max(0, _rectangle(item)[3] - _rectangle(item)[1]),
         )
 
+    def find_thread_container(self, window=None):
+        """Find the live scroll container, retrying window reconstruction."""
+        last_error = None
+        current_window = window
+        for attempt in range(3):
+            try:
+                current_window = current_window or self.find_window()
+                return self._find_thread_container_once(current_window)
+            except Exception as exc:
+                last_error = exc
+                if attempt < 2:
+                    type(self)._cached_window_handle = 0
+                    current_window = None
+                    time.sleep(0.03 * (attempt + 1))
+        raise last_error or RuntimeError("未找到对话滚动容器")
+
     @staticmethod
     def scroll_percent(container) -> float:
         try:
@@ -250,6 +266,20 @@ class WindowsUIA:
         container.iface_scroll.SetScrollPercent(
             NO_SCROLL, max(0.0, min(100.0, percent))
         )
+
+    def _set_scroll_percent_resilient(self, container, percent: float):
+        """Set scroll position and reacquire transiently invalid UIA nodes."""
+        last_error = None
+        for attempt in range(3):
+            try:
+                self.set_scroll_percent(container, percent)
+                return container
+            except Exception as exc:
+                last_error = exc
+                if attempt < 2:
+                    container = self.find_thread_container()
+                    time.sleep(0.02 * (attempt + 1))
+        raise last_error or RuntimeError("无法设置对话滚动位置")
 
     @staticmethod
     def _message_pairs(container) -> list[tuple[object, object]]:
@@ -295,7 +325,10 @@ class WindowsUIA:
                     continue
             except Exception:
                 continue
-            for candidate in children[index + 1 : index + 5]:
+            # File/image attachments are direct siblings before the question
+            # bubble. Scan until the next semantic message marker instead of
+            # using a fixed four-node lookahead.
+            for candidate in children[index + 1 :]:
                 try:
                     candidate_info = element_info(candidate)
                     name = (candidate_info.name or "").strip()
@@ -356,7 +389,9 @@ class WindowsUIA:
             try:
                 current = self.scroll_percent(container)
                 if _transient_end_jump(requested_percent, current):
-                    self.set_scroll_percent(container, requested_percent)
+                    container = self._set_scroll_percent_resilient(
+                        container, requested_percent
+                    )
                     last_signature = None
                 else:
                     latest_pairs = self._visible_pairs(container)
@@ -441,7 +476,7 @@ class WindowsUIA:
         questions: list[Question] = []
         positions: dict[str, int] = {}
         try:
-            self.set_scroll_percent(container, 0.0)
+            container = self._set_scroll_percent_resilient(container, 0.0)
             percent = 0.0
             for _page_number in range(256):
                 page_timeout = (
@@ -476,7 +511,9 @@ class WindowsUIA:
                 percent = min(
                     100.0, max(percent + step, stable_current + 3.0)
                 )
-                self.set_scroll_percent(container, percent)
+                container = self._set_scroll_percent_resilient(
+                    container, percent
+                )
                 if percent >= 100.0 and added == 0:
                     # One final settled read at 100% is still required.
                     continue
@@ -484,7 +521,7 @@ class WindowsUIA:
                 raise RuntimeError("扫描页数超过安全上限，已停止")
         finally:
             try:
-                self.set_scroll_percent(container, original)
+                self._set_scroll_percent_resilient(container, original)
             except Exception:
                 try:
                     self.set_scroll_percent(

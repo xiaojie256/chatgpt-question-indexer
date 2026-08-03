@@ -1,3 +1,4 @@
+from chatgpt_question_indexer.models import ConversationIndex
 from chatgpt_question_indexer.parser import (
     AccessibleNode,
     merge_questions,
@@ -60,6 +61,29 @@ def test_merge_deduplicates_across_virtualized_pages():
     assert merged[0].scroll_percent == 50
 
 
+def test_prompt_with_many_attachments_uses_body_text():
+    children = [
+        node("Text", "你说：", class_name="sr-only select-none"),
+        *[
+            node("Button", f"附件 {index}.cpp")
+            for index in range(1, 7)
+        ],
+        node(
+            "Group",
+            element_id="attached-question",
+            children=[node("Text", "存在 AI 编程的痕迹吗")],
+        ),
+        node("Button", "复制消息"),
+        node("Text", "ChatGPT 说：", class_name="sr-only select-none"),
+    ]
+
+    questions = parse_direct_children(children, 18.0)
+
+    assert len(questions) == 1
+    assert questions[0].text == "存在 AI 编程的痕迹吗"
+    assert questions[0].element_id == "attached-question"
+
+
 def test_probe_merge_preserves_scanned_scroll_position():
     page = [
         node("Text", "You said:", class_name="sr-only select-none"),
@@ -80,3 +104,16 @@ def test_probe_merge_preserves_scanned_scroll_position():
 def test_summary_uses_fifty_characters():
     value = "问" * 60
     assert summarize(value) == "问" * 50 + "…"
+
+
+def test_partial_index_round_trip_preserves_completeness():
+    partial = ConversationIndex(
+        fingerprint="partial",
+        window_title="ChatGPT",
+        conversation_title="附件对话",
+        is_complete=False,
+    )
+
+    restored = ConversationIndex.from_dict(partial.to_dict())
+
+    assert restored.is_complete is False

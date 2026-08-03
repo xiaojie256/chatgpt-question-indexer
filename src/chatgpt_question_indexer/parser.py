@@ -56,7 +56,10 @@ def parse_direct_children(
         if marker not in USER_MARKERS or "sr-only" not in node.class_name:
             continue
         message_node = None
-        for candidate in children[index + 1 : index + 5]:
+        # Attachments are exposed as direct siblings between the semantic
+        # marker and the actual text bubble. Do not assume the bubble is one
+        # of the next four nodes: a single prompt can contain many files.
+        for candidate in children[index + 1 :]:
             candidate_name = normalize_text(candidate.name)
             if candidate_name in USER_MARKERS + ASSISTANT_MARKERS:
                 break
