@@ -18,8 +18,8 @@ data/
 logs/
 
 # Accessibility diagnostics (may contain conversation text)
-diagnostics/accessibility-tree.txt
-diagnostics/summary.json
+diagnostics/accessibility-tree*.txt
+diagnostics/summary*.json
 diagnostics/*.png
 
 # Build artifacts

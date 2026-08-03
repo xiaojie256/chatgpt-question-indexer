@@ -4,6 +4,9 @@ from dataclasses import asdict, dataclass, field
 from typing import Any
 
 
+CURRENT_SCROLL_MODE = "exact-v3"
+
+
 @dataclass(slots=True)
 class Question:
     text: str
@@ -36,6 +39,7 @@ class ConversationIndex:
     questions: list[Question] = field(default_factory=list)
     scroll_mode: str = "percentage"
     updated_at: str = ""
+    is_complete: bool = True
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -45,6 +49,7 @@ class ConversationIndex:
             "questions": [question.to_dict() for question in self.questions],
             "scroll_mode": self.scroll_mode,
             "updated_at": self.updated_at,
+            "is_complete": self.is_complete,
         }
 
     @classmethod
@@ -61,3 +66,5 @@ class ConversationSnapshot:
     window_title: str
     conversation_title: str
     questions: list[Question] = field(default_factory=list)
+    container_id: str = ""
+    process_id: int = 0

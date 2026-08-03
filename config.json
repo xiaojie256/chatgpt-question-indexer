@@ -1,8 +1,8 @@
 {
   "sidebar_width": 280,
   "collapsed_width": 46,
-  "auto_refresh_seconds": 15,
-  "scan_pause_ms": 180,
+  "auto_refresh_seconds": 60,
+  "scan_pause_ms": 120,
   "cache_max_conversations": 30,
   "cache_max_megabytes": 25,
   "cache_retention_days": 90,
